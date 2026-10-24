@@ -159,29 +159,18 @@ ingress() {
         "${IQDISC_OPTS}" || return 1
 
     # What reaches the host from the WAN side reaches the IFB from the
-    # port's own ingress, below every VLAN device on it: routed traffic the
-    # hardware did not take, and multicast such as IPTV on any VLAN, so the
-    # download rate covers all of it. A PPPoE session is the exception: its
-    # frames still carry the PPPoE header there, which hides the IP header
-    # from CAKE's ECN marking and host hashing, so they pass the port and
-    # are taken from the session's own device instead. The IFB marks what
-    # it hands back so that it is not redirected a second time.
-    # The port's ingress qdisc may carry other filters, such as the switch
-    # classifiers ppe-qos installs, so only this script's own filters are
-    # replaced: preferences 4, 5 and 10.
+    # port's own ingress, below every VLAN and PPPoE device on it: routed
+    # traffic the hardware did not take, and multicast such as IPTV on any
+    # VLAN, so the download rate covers all of it. It has to be the port:
+    # the software flowtable takes a PPPoE session's frames at the VLAN
+    # device below the session and forwards them without passing it, so a
+    # redirect on the PPPoE device would miss every flow the switch did not
+    # offload. The IFB marks what it hands back so that it is not redirected
+    # a second time. The port's ingress qdisc may carry other filters, such
+    # as the switch classifiers qca-ppe-qos installs, so only this script's
+    # own filters are replaced: preferences 4, 5 and 10.
     clear_filters $IFACE
     SILENT=1 $TC qdisc add dev $IFACE handle ffff: ingress
-    # The session may run in a VLAN, whose tag the port still carries here.
-    if [ "$(cat /sys/class/net/$UL/type 2>/dev/null)" = 512 ] &&
-       $TC filter add dev $IFACE parent ffff: protocol 802.1Q prio 4 \
-           flower skip_hw vlan_ethtype 0x8864 action pass; then
-        $TC filter add dev $IFACE parent ffff: protocol 0x8864 prio 5 \
-            matchall action pass || return 1
-        clear_filters $UL
-        SILENT=1 $TC qdisc add dev $UL handle ffff: ingress
-        $TC filter add dev $UL parent ffff: protocol all prio 10 matchall \
-            action mirred egress redirect dev $ifb || return 1
-    fi
     $TC filter add dev $IFACE parent ffff: protocol all prio 10 matchall \
         action mirred egress redirect dev $ifb || return 1
 
@@ -217,6 +206,9 @@ sqm_start() {
         return 1
     }
     UL=$(uplink_dev) || { sqm_error "no uplink device on $IFACE"; return 1; }
+    # Which flows cross the shaped link, in either direction, is told by
+    # where this device meets the switch, upload shaped or not.
+    ppe_param uplink $UL || { sqm_error "the qca_ppe driver does not take an uplink"; return 1; }
 
     # A start that fails half way leaves nothing behind: no state file is
     # written for it, so no stop would ever follow.
@@ -241,6 +233,7 @@ sqm_stop() {
     ppe_param dl_shaper ""
     ppe_param ul_shaper ""
     ppe_param ct_dscp false 2>/dev/null
+    ppe_param uplink "" 2>/dev/null
 
     ul=$(uplink_dev)
     ifb=$(ifb_name $IFACE)
