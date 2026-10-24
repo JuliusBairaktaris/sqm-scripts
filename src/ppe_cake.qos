@@ -95,7 +95,7 @@ ppe_devlink() {
 clear_filters() {
     local pref
 
-    for pref in 4 5 10; do
+    for pref in 3 4 5 10; do
         SILENT=1 $TC filter del dev $1 parent ffff: pref $pref
     done
 }
@@ -212,6 +212,19 @@ ingress() {
 
     # Nor may the switch's rate limit towards the host shape it again.
     ppe_param cpu_port_rate 0 2>/dev/null
+
+    # ppe_hybrid keeps download flows in the switch until the download
+    # reaches CAKE's rate: a count-only meter on the port, at that rate with
+    # five milliseconds of burst so that frames arriving back to back at the
+    # line rate stay green, tells the driver when (red frames pass and are
+    # counted). It counts the Ethernet frame, so the overhead is the part of
+    # CAKE's 50 bytes outside it: preamble and gap.
+    if [ "$PPE_HYBRID" = 1 ]; then
+        $TC filter add dev $IFACE parent ffff: pref 3 protocol all matchall \
+            skip_sw action police rate ${DOWNLINK}kbit \
+            burst $((DOWNLINK * 5 / 8)) overhead 20 conform-exceed pipe/pipe ||
+            sqm_warn "no count-only meter on $IFACE: the download stays in CAKE"
+    fi
 
     # Offloaded frames get the DSCP a firewall rule stamped into their
     # conntrack mark on the first packets (act_ctinfo's layout: bit 7 set,
