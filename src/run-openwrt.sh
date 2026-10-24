@@ -71,6 +71,7 @@ start_sqm_section() {
     export QDISC=$(config_get "$section" qdisc)
     export SCRIPT=$(config_get "$section" script)
     export USE_MQ=$(config_get "$section" use_mq)
+    export L4S_CE_THRESHOLD=$(config_get "$section" l4s_ce_threshold)
 
     # The UCI names for these two variables are confusing and should have been
     # changed ages ago. For now, keep the bad UCI names but use meaningful
