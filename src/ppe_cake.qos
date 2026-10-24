@@ -1,0 +1,291 @@
+################################################################################
+# ppe_cake.qos (CAKE and L4S for a Qualcomm PPE that offloads the flows)
+#
+# Abstract:
+# The PPE routes, NATs and encapsulates offloaded connections in hardware,
+# but its queues can only drop on a buffer count: no flow queueing, no
+# COBALT, no ECN marking. This script keeps the hardware doing the lookup
+# and has the frames of every flow that crosses the shaped link pass a
+# qdisc on the way out, so CAKE sees all of them.
+#
+# Each direction is one CAKE with its own shaper. CAKE queues every flow
+# separately, so it can serve classic and L4S flows from one instance:
+# COBALT for the classic ones, and for packets carrying ECT(1), the
+# L4S identifier, a CE mark with a probability that rises from zero at
+# L4S_CE_THRESHOLD of queueing to one at twice that (ce_threshold,
+# ce_threshold_selector 0x01/0x03). The 3 ms default keeps a Prague
+# flow at 85 to 98 percent of the link at 10 to 40 ms RTT.
+#
+# Upload: CAKE sits on the uplink device (pppoe-wan, a VLAN device or the
+# port itself). The qca_ppe driver hands offloaded upload frames to that
+# device without their link headers (devlink param ul_shaper), and the
+# kernel's own PPPoE and VLAN code adds them after the qdisc.
+#
+# Download: CAKE sits on an IFB. Everything the host receives from the WAN
+# port (routed traffic the hardware did not take, multicast such as IPTV on
+# any VLAN) reaches it through a redirect on the port's ingress, and the
+# driver hands offloaded download frames to it directly (devlink param
+# dl_shaper) once they are routed, so the IFB sends them on to the LAN port
+# or Wi-Fi interface they were routed to.
+#
+# Configure this on the physical WAN port (wan); the uplink device is the
+# one on top of it that holds the WAN address.
+#
+################################################################################
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License version 2 as
+# published by the Free Software Foundation.
+#
+#       Copyright (C) 2026 Julius Bairaktaris
+#
+################################################################################
+
+. ${SQM_LIB_DIR}/defaults.sh
+QDISC=cake
+# use_mq gives the download IFB a queue per CPU and runs cake_mq on it.
+SUPPORT_MQ=1
+
+# The link layer options: the configured ones (linklayer, overhead, mpu),
+# else what the wire carries per packet beyond the IP packet on PPPoE over a
+# VLAN: preamble and inter-frame gap (20), Ethernet header and FCS (18), one
+# VLAN tag (4) and the PPPoE and PPP headers (8). CAKE counts from the
+# network header, so offloaded frames, which reach the download IFB with
+# their Ethernet header, and routed packets, which do not, cost the same.
+LLA=$(get_cake_lla_string)
+[ -n "$LLA" ] || LLA="overhead 50"
+
+# The queueing delay in milliseconds past which an L4S packet is marked CE
+# (uci l4s_ce_threshold); 0 turns the mark off.
+L4S_CE_THRESHOLD=${L4S_CE_THRESHOLD:-3}
+L4S_CE_THRESHOLD=${L4S_CE_THRESHOLD%ms}
+L4S=
+[ "$L4S_CE_THRESHOLD" = 0 ] ||
+    L4S="ce_threshold ${L4S_CE_THRESHOLD}ms ce_threshold_selector 0x01/0x03"
+
+################################################################################
+
+# The L3 device that carries the WAN on $IFACE: a PPPoE device whose session
+# runs over $IFACE or a VLAN of it, else a VLAN device of $IFACE, else $IFACE
+# itself, whichever holds an address. Found from the devices themselves
+# rather than the default route, which multi-WAN setups point elsewhere.
+uplink_dev() {
+    local dev lower best="" rank=0 r
+
+    for dev in $(ls /sys/class/net) ; do
+        r=0
+        case "$(cat /sys/class/net/$dev/type 2>/dev/null)" in
+            512)
+                lower=$(uci -q get network.${dev#pppoe-}.device)
+                case "$lower" in "$IFACE"|"$IFACE".*) r=3 ;; esac ;;
+            1)
+                # a bridge has its ports as lowers too, and is the LAN
+                [ -d /sys/class/net/$dev/bridge ] && continue
+                [ "$dev" = "$IFACE" ] && r=1
+                [ -e /sys/class/net/$dev/lower_$IFACE ] && r=2 ;;
+        esac
+        [ $r -gt 0 ] || continue
+        ip addr show dev $dev 2>/dev/null | grep -q "inet6\? [0-9a-f].* scope global" || continue
+        [ $r -gt $rank ] && { best=$dev; rank=$r; }
+    done
+
+    [ -n "$best" ] && echo $best
+}
+
+# The switch the uplink port belongs to, as devlink names it.
+ppe_devlink() {
+    devlink port show $IFACE 2>/dev/null | sed -n '1s|/[0-9]*:.*||p'
+}
+
+clear_filters() {
+    local pref
+
+    for pref in 4 5 10; do
+        SILENT=1 $TC filter del dev $1 parent ffff: pref $pref
+    done
+}
+
+ppe_param() {
+    local dl=$(ppe_devlink)
+
+    [ -n "$dl" ] || return 1
+    devlink dev param set $dl name $1 value "$2" cmode runtime
+}
+
+# CAKE on $1 at $2 kbit/s with the L4S mark, then $3, the per-direction
+# options, and $4, the user's own (iqdisc_opts or eqdisc_opts), which come
+# last so that they override. A tc without ce_threshold rejects it, and a
+# kernel without it ignores the attribute, so the qdisc is read back:
+# without the mark CAKE still shapes every flow, and the log says what is
+# missing.
+cake_l4s() {
+    local dev=$1 rate=$2 opts=$3 user=$4 q
+
+    q=$(select_cake $dev)
+    SILENT=1 $TC qdisc del dev $dev root
+    SILENT=1 $TC qdisc add dev $dev root $q bandwidth ${rate}kbit \
+        $LLA nat $opts $L4S $user ||
+    $TC qdisc add dev $dev root $q bandwidth ${rate}kbit \
+        $LLA nat $opts $user || return 1
+
+    [ -z "$L4S" ] || $TC_BINARY qdisc show dev $dev | grep -q ce_threshold ||
+        sqm_warn "no L4S marking on $dev: the kernel or tc lacks CAKE's ce_threshold"
+    return 0
+}
+
+egress() {
+    # An offloaded hardware shaper left on the port by an earlier
+    # configuration would shape a second time.
+    SILENT=1 $TC qdisc del dev $IFACE root
+
+    # With use_mq the upload shaper moves to a multiqueue IFB in front of
+    # the uplink, as the download one is, since a VLAN or PPPoE uplink has
+    # a single transmit queue: offloaded frames are handed to the IFB by
+    # the driver, and what the host routes itself is redirected there from
+    # the uplink's egress. The IFB sends both on to the uplink.
+    local dev=$UL ulifb
+
+    if [ "$USE_MQ" = 1 ] && [ "$(grep -c processor /proc/cpuinfo)" -gt 1 ]; then
+        ulifb=$(ifb_name $UL)
+        [ -e /sys/class/net/$ulifb ] || create_ifb $ulifb || return 1
+        $IP link set dev $ulifb up
+        dev=$ulifb
+    fi
+
+    cake_l4s $dev ${UPLINK} "diffserv4 dual-srchost ack-filter" \
+        "${EQDISC_OPTS}" || return 1
+
+    if [ "$dev" != "$UL" ]; then
+        SILENT=1 $TC qdisc del dev $UL root
+        SILENT=1 $TC qdisc add dev $UL clsact
+        SILENT=1 $TC filter del dev $UL egress pref 10
+        $TC filter add dev $UL egress protocol all prio 10 matchall \
+            action mirred egress redirect dev $dev || return 1
+    fi
+    ppe_param ul_shaper $dev || return 1
+    UL_SHAPER=$dev
+}
+
+ingress() {
+    local ifb diffserv wash
+
+    ifb=$(ifb_name $IFACE)
+    [ -e /sys/class/net/$ifb ] || create_ifb $ifb || return 1
+    $IP link set dev $ifb up
+
+    # Not CAKE's ingress mode: charging its drops against the rate costs
+    # about 8% of the download here (LibreQoS, 2 runs each: 218-222 against
+    # 230-245 Mbit/s at 305000, all A+), and the shaper already sits below
+    # the line rate.
+    # The standard squash_ingress and squash_dscp options: by default the
+    # download is one best-effort tin with the DSCP the ISP set cleared,
+    # which CAKE does without touching the ECN field.
+    diffserv=besteffort
+    [ "$IGNORE_DSCP_INGRESS" = 0 ] && diffserv=diffserv4
+    wash=
+    [ "$ZERO_DSCP_INGRESS" = 1 ] && wash=wash
+    cake_l4s $ifb ${DOWNLINK} "$diffserv dual-dsthost $wash" \
+        "${IQDISC_OPTS}" || return 1
+
+    # What reaches the host from the WAN side reaches the IFB from the
+    # port's own ingress, below every VLAN and PPPoE device on it: routed
+    # traffic the hardware did not take, and multicast such as IPTV on any
+    # VLAN, so the download rate covers all of it. It has to be the port:
+    # the software flowtable takes a PPPoE session's frames at the VLAN
+    # device below the session and forwards them without passing it, so a
+    # redirect on the PPPoE device would miss every flow the switch did not
+    # offload. The IFB marks what it hands back so that it is not redirected
+    # a second time. The port's ingress qdisc may carry other filters, such
+    # as the switch classifiers qca-ppe-qos installs, so only this script's
+    # own filters are replaced: preferences 4, 5 and 10.
+    clear_filters $IFACE
+    SILENT=1 $TC qdisc add dev $IFACE handle ffff: ingress
+    $TC filter add dev $IFACE parent ffff: protocol all prio 10 matchall \
+        action mirred egress redirect dev $ifb || return 1
+
+    # Nor may the switch's rate limit towards the host shape it again.
+    ppe_param cpu_port_rate 0 2>/dev/null
+
+    # Offloaded frames get the DSCP a firewall rule stamped into their
+    # conntrack mark on the first packets (act_ctinfo's layout: bit 7 set,
+    # DSCP in bits 0-5), which the later packets of an offloaded flow never
+    # pass. Flows without such a mark are left as they are.
+    ppe_param ct_dscp true 2>/dev/null
+    ppe_param dl_shaper $ifb || return 1
+    sqm_log "ppe_cake: upload on ${UL_SHAPER:-$UL}, download on $ifb"
+}
+
+sqm_prepare_script() {
+    do_modules
+    verify_qdisc cake || return 1
+}
+
+# sqm_start_default would create its IFB for $IFACE before egress() knows
+# the uplink; this is that function with the IFB left to ingress().
+sqm_start() {
+    [ -n "$IFACE" ] || return 1
+
+    nft_log_restart
+    sqm_prepare_script || return 1
+
+    # Without the switch's driver nothing hands the offloaded flows over,
+    # and CAKE would shape only what the host routes itself.
+    [ -n "$(ppe_devlink)" ] || {
+        sqm_error "$IFACE is not a port of a qca_ppe switch"
+        return 1
+    }
+    UL=$(uplink_dev) || { sqm_error "no uplink device on $IFACE"; return 1; }
+    # Which flows cross the shaped link, in either direction, is told by
+    # where this device meets the switch, upload shaped or not.
+    ppe_param uplink $UL || { sqm_error "the qca_ppe driver does not take an uplink"; return 1; }
+
+    # A start that fails half way leaves nothing behind: no state file is
+    # written for it, so no stop would ever follow.
+    if [ "${UPLINK}" -ne 0 ] ; then
+        CUR_DIRECTION="egress"
+        egress || { sqm_stop; return 1; }
+    fi
+    if [ "${DOWNLINK}" -ne 0 ] ; then
+        CUR_DIRECTION="ingress"
+        verify_qdisc ingress "ingress" || { sqm_stop; return 1; }
+        ingress || { sqm_stop; return 1; }
+    fi
+
+    return 0
+}
+
+sqm_stop() {
+    local ul ifb
+
+    # Back to the hardware path first, so that no flow is handed to a
+    # device that is about to lose its qdisc.
+    ppe_param dl_shaper ""
+    ppe_param ul_shaper ""
+    ppe_param ct_dscp false 2>/dev/null
+    ppe_param uplink "" 2>/dev/null
+    SILENT=1 $TC qdisc del dev $IFACE root
+
+    ul=$(uplink_dev)
+    ifb=$(ifb_name $IFACE)
+    [ -n "$ul" ] && SILENT=1 $TC qdisc del dev $ul root
+    [ -n "$ul" ] && clear_filters $ul
+    [ -n "$ul" ] && SILENT=1 $TC filter del dev $ul egress pref 10
+    [ -n "$ul" ] && [ -e /sys/class/net/$(ifb_name $ul) ] && delete_ifb $(ifb_name $ul)
+    clear_filters $IFACE
+    [ -e /sys/class/net/$ifb ] && delete_ifb $ifb
+
+    # The qdiscs that held this script's filters go once nothing else uses
+    # them, or a script started after this one could not add its own
+    # (piece_of_cake on the uplink fails on "Exclusivity flag on"). Plain tc:
+    # $TC captures its output.
+    for d in $ul $IFACE; do
+        [ -e /sys/class/net/$d ] || continue
+        [ -z "$(tc filter show dev $d ingress)$(tc filter show dev $d egress)" ] || continue
+        SILENT=1 $TC qdisc del dev $d clsact
+        SILENT=1 $TC qdisc del dev $d ingress
+    done
+    nft_cleanup
+    return 0
+}
+
+################################################################################
