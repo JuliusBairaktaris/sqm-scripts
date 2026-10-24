@@ -23,7 +23,20 @@ ports_for_device() {
     config_foreach list_ports device "$devname"
 }
 
-ALL_DEVICES=$(echo $DEVICE $(uci -q get network.$INTERFACE.ifname) $(ports_for_device $(uci -q get network.$INTERFACE.device)) | tr ' ' '\n' | sort -u)
+# Each device and the devices it sits on: a queue may be set on the port under
+# a VLAN or PPPoE interface (the wan port under wan.7 under pppoe-wan).
+with_lower() {
+    local dev lower
+    for dev in "$@"; do
+        echo $dev
+        for lower in /sys/class/net/$dev/lower_*; do
+            [ -e "$lower" ] && echo ${lower##*/lower_}
+        done
+    done
+}
+
+IFACE_DEVICE=$(uci -q get network.$INTERFACE.device)
+ALL_DEVICES=$(with_lower $DEVICE $(uci -q get network.$INTERFACE.ifname) $IFACE_DEVICE $(ports_for_device $IFACE_DEVICE) | sort -u)
 
 restart_sqm() {
     for dev in $ALL_DEVICES; do
