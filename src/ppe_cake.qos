@@ -43,6 +43,8 @@
 
 . ${SQM_LIB_DIR}/defaults.sh
 QDISC=cake
+# use_mq gives the download IFB a queue per CPU and runs cake_mq on it.
+SUPPORT_MQ=1
 
 # The link layer options: the configured ones (linklayer, overhead, mpu),
 # else what the wire carries per packet beyond the IP packet on PPPoE over a
@@ -112,14 +114,15 @@ ppe_param() {
 # without the mark CAKE still shapes every flow, and the log says what is
 # missing.
 cake_l4s() {
-    local dev=$1 rate=$2 opts=$3 user=$4
+    local dev=$1 rate=$2 opts=$3 user=$4 q
 
+    q=$(select_cake $dev)
     SILENT=1 $TC qdisc del dev $dev root
-    SILENT=1 $TC qdisc add dev $dev root cake bandwidth ${rate}kbit \
+    SILENT=1 $TC qdisc add dev $dev root $q bandwidth ${rate}kbit \
         $LLA nat $opts \
         ce_threshold $L4S_CE_THRESHOLD ce_threshold_selector 0x01/0x03 \
         $user ||
-    $TC qdisc add dev $dev root cake bandwidth ${rate}kbit \
+    $TC qdisc add dev $dev root $q bandwidth ${rate}kbit \
         $LLA nat $opts $user || return 1
 
     $TC_BINARY qdisc show dev $dev | grep -q ce_threshold ||
@@ -132,9 +135,42 @@ egress() {
     # configuration would shape a second time.
     SILENT=1 $TC qdisc del dev $IFACE root
 
-    cake_l4s $UL ${UPLINK} "diffserv4 dual-srchost ack-filter" \
+    # With use_mq the upload shaper moves to a multiqueue IFB in front of
+    # the uplink, as the download one is, since a VLAN or PPPoE uplink has
+    # a single transmit queue: offloaded frames are handed to the IFB by
+    # the driver, and what the host routes itself is redirected there from
+    # the uplink's egress. The IFB sends both on to the uplink.
+    local dev=$UL ulifb
+
+    if [ "$USE_MQ" = 1 ] && [ "$(grep -c processor /proc/cpuinfo)" -gt 1 ]; then
+        ulifb=$(ifb_name $UL)
+        [ -e /sys/class/net/$ulifb ] || create_ifb $ulifb || return 1
+        $IP link set dev $ulifb up
+        dev=$ulifb
+    fi
+
+    cake_l4s $dev ${UPLINK} "diffserv4 dual-srchost ack-filter" \
         "${EQDISC_OPTS}" || return 1
-    ppe_param ul_shaper $UL || return 1
+
+    if [ "$dev" != "$UL" ]; then
+        SILENT=1 $TC qdisc del dev $UL root
+        SILENT=1 $TC qdisc add dev $UL clsact
+        SILENT=1 $TC filter del dev $UL egress pref 10
+        $TC filter add dev $UL egress protocol all prio 10 matchall \
+            action mirred egress redirect dev $dev || return 1
+    fi
+    ppe_param ul_shaper $dev || return 1
+    UL_SHAPER=$dev
+
+    # ppe_hybrid keeps upload flows in the switch until they queue: a
+    # hardware shaper on the port, just above CAKE's rate and counting the
+    # same wire bytes as its overhead, holds that queue where the driver
+    # sees it and hands the upload to CAKE within a few milliseconds.
+    if [ "$PPE_HYBRID" = 1 ]; then
+        $TC qdisc replace dev $IFACE root tbf rate $((UPLINK * 102 / 100))kbit \
+            burst 3000 latency 10ms || return 1
+        ppe_param hybrid true || return 1
+    fi
 }
 
 ingress() {
@@ -183,7 +219,7 @@ ingress() {
     # pass. Flows without such a mark are left as they are.
     ppe_param ct_dscp true 2>/dev/null
     ppe_param dl_shaper $ifb || return 1
-    sqm_log "ppe_cake: upload on $UL, download on $ifb"
+    sqm_log "ppe_cake: upload on ${UL_SHAPER:-$UL}, download on $ifb"
 }
 
 sqm_prepare_script() {
@@ -233,12 +269,16 @@ sqm_stop() {
     ppe_param dl_shaper ""
     ppe_param ul_shaper ""
     ppe_param ct_dscp false 2>/dev/null
+    ppe_param hybrid false 2>/dev/null
     ppe_param uplink "" 2>/dev/null
+    SILENT=1 $TC qdisc del dev $IFACE root
 
     ul=$(uplink_dev)
     ifb=$(ifb_name $IFACE)
     [ -n "$ul" ] && SILENT=1 $TC qdisc del dev $ul root
     [ -n "$ul" ] && clear_filters $ul
+    [ -n "$ul" ] && SILENT=1 $TC filter del dev $ul egress pref 10
+    [ -n "$ul" ] && [ -e /sys/class/net/$(ifb_name $ul) ] && delete_ifb $(ifb_name $ul)
     clear_filters $IFACE
     [ -e /sys/class/net/$ifb ] && delete_ifb $ifb
     nft_cleanup
