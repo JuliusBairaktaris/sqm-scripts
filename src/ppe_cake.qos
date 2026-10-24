@@ -93,7 +93,7 @@ ppe_devlink() {
 ppe_param() {
     local dl=$(ppe_devlink)
 
-    [ -n "$dl" ] || return 0
+    [ -n "$dl" ] || return 1
     devlink dev param set $dl name $1 value "$2" cmode runtime
 }
 
@@ -120,22 +120,17 @@ cake_l4s() {
 }
 
 egress() {
-    local ul
-
-    ul=$(uplink_dev) || { sqm_error "no uplink device on $IFACE"; return 1; }
-    UL=$ul
-
     # An offloaded hardware shaper left on the port by an earlier
     # configuration would shape a second time.
     SILENT=1 $TC qdisc del dev $IFACE root
 
-    cake_l4s $ul ${UPLINK} "diffserv4 dual-srchost ack-filter" \
+    cake_l4s $UL ${UPLINK} "diffserv4 dual-srchost ack-filter" \
         "${EQDISC_OPTS}" || return 1
-    ppe_param ul_shaper $ul
+    ppe_param ul_shaper $UL || return 1
 }
 
 ingress() {
-    local ifb
+    local ifb diffserv wash
 
     ifb=$(ifb_name $IFACE)
     [ -e /sys/class/net/$ifb ] || create_ifb $ifb || return 1
@@ -145,23 +140,45 @@ ingress() {
     # about 8% of the download here (LibreQoS, 2 runs each: 218-222 against
     # 230-245 Mbit/s at 305000, all A+), and the shaper already sits below
     # the line rate.
-    cake_l4s $ifb ${DOWNLINK} "besteffort dual-dsthost" \
+    # The standard squash_ingress and squash_dscp options: by default the
+    # download is one best-effort tin with the DSCP the ISP set cleared,
+    # which CAKE does without touching the ECN field.
+    diffserv=besteffort
+    [ "$IGNORE_DSCP_INGRESS" = 0 ] && diffserv=diffserv4
+    wash=
+    [ "$ZERO_DSCP_INGRESS" = 1 ] && wash=wash
+    cake_l4s $ifb ${DOWNLINK} "$diffserv dual-dsthost $wash" \
         "${IQDISC_OPTS}" || return 1
 
     # What reaches the host from the WAN side reaches the IFB from the
-    # port's own ingress, below every VLAN and PPPoE device on it: routed
-    # traffic the hardware did not take, and multicast such as IPTV on any
-    # VLAN, so the download rate covers all of it. The IFB marks what it
-    # hands back so that it is not redirected a second time.
+    # port's own ingress, below every VLAN device on it: routed traffic the
+    # hardware did not take, and multicast such as IPTV on any VLAN, so the
+    # download rate covers all of it. A PPPoE session is the exception: its
+    # frames still carry the PPPoE header there, which hides the IP header
+    # from CAKE's ECN marking and host hashing, so they pass the port and
+    # are taken from the session's own device instead. The IFB marks what
+    # it hands back so that it is not redirected a second time.
     SILENT=1 $TC qdisc del dev $IFACE handle ffff: ingress
     $TC qdisc add dev $IFACE handle ffff: ingress
+    # The session may run in a VLAN, whose tag the port still carries here.
+    if [ "$(cat /sys/class/net/$UL/type 2>/dev/null)" = 512 ] &&
+       $TC filter add dev $IFACE parent ffff: protocol 802.1Q prio 4 \
+           flower skip_hw vlan_ethtype 0x8864 action pass; then
+        $TC filter add dev $IFACE parent ffff: protocol 0x8864 prio 5 \
+            matchall action pass || return 1
+        SILENT=1 $TC qdisc del dev $UL handle ffff: ingress
+        $TC qdisc add dev $UL handle ffff: ingress
+        $TC filter add dev $UL parent ffff: protocol all prio 10 matchall \
+            action mirred egress redirect dev $ifb || return 1
+    fi
     $TC filter add dev $IFACE parent ffff: protocol all prio 10 matchall \
         action mirred egress redirect dev $ifb || return 1
 
     # Nor may the switch's rate limit towards the host shape it again.
     ppe_param cpu_port_rate 0 2>/dev/null
 
-    ppe_param dl_shaper $ifb
+    ppe_param dl_shaper $ifb || return 1
+    sqm_log "ppe_cake: upload on $UL, download on $ifb"
 }
 
 sqm_prepare_script() {
@@ -177,14 +194,24 @@ sqm_start() {
     nft_log_restart
     sqm_prepare_script || return 1
 
+    # Without the switch's driver nothing hands the offloaded flows over,
+    # and CAKE would shape only what the host routes itself.
+    [ -n "$(ppe_devlink)" ] || {
+        sqm_error "$IFACE is not a port of a qca_ppe switch"
+        return 1
+    }
+    UL=$(uplink_dev) || { sqm_error "no uplink device on $IFACE"; return 1; }
+
+    # A start that fails half way leaves nothing behind: no state file is
+    # written for it, so no stop would ever follow.
     if [ "${UPLINK}" -ne 0 ] ; then
         CUR_DIRECTION="egress"
-        egress || return 1
+        egress || { sqm_stop; return 1; }
     fi
     if [ "${DOWNLINK}" -ne 0 ] ; then
         CUR_DIRECTION="ingress"
-        verify_qdisc ingress "ingress" || return 1
-        ingress || return 1
+        verify_qdisc ingress "ingress" || { sqm_stop; return 1; }
+        ingress || { sqm_stop; return 1; }
     fi
 
     return 0
@@ -201,6 +228,7 @@ sqm_stop() {
     ul=$(uplink_dev)
     ifb=$(ifb_name $IFACE)
     [ -n "$ul" ] && SILENT=1 $TC qdisc del dev $ul root
+    [ -n "$ul" ] && SILENT=1 $TC qdisc del dev $ul handle ffff: ingress
     SILENT=1 $TC qdisc del dev $IFACE handle ffff: ingress
     [ -e /sys/class/net/$ifb ] && delete_ifb $ifb
     nft_cleanup
