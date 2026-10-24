@@ -163,7 +163,9 @@ ppe_devlink() {
 ingress_teardown() {
     local dev
 
-    SILENT=1 $TC qdisc del dev $IFACE ingress
+    # Only this script's mark: the port's ingress may carry other filters,
+    # such as the switch classifiers qca-ppe-qos installs.
+    SILENT=1 $TC filter del dev $IFACE parent ffff: pref 511
     for dev in $(ingress_ports) ; do
         SILENT=1 $TC qdisc del dev $dev root
     done

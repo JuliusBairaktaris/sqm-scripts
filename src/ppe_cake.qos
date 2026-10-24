@@ -150,11 +150,7 @@ ingress() {
     # the line rate.
     # The standard squash_ingress and squash_dscp options: by default the
     # download is one best-effort tin with the DSCP the ISP set cleared,
-    # which CAKE does without touching the ECN field. Honouring DSCP also
-    # has the driver give offloaded frames the DSCP a firewall rule stamped
-    # into their conntrack mark on the first packets (act_ctinfo's layout:
-    # bit 7 set, DSCP in bits 0-5), which the later packets of an offloaded
-    # flow never pass. Clear squash_dscp as well, or CAKE washes it again.
+    # which CAKE does without touching the ECN field.
     diffserv=besteffort
     [ "$IGNORE_DSCP_INGRESS" = 0 ] && diffserv=diffserv4
     wash=
@@ -192,7 +188,11 @@ ingress() {
     # Nor may the switch's rate limit towards the host shape it again.
     ppe_param cpu_port_rate 0 2>/dev/null
 
-    ppe_param ct_dscp $([ "$IGNORE_DSCP_INGRESS" = 0 ] && echo true || echo false) 2>/dev/null
+    # Offloaded frames get the DSCP a firewall rule stamped into their
+    # conntrack mark on the first packets (act_ctinfo's layout: bit 7 set,
+    # DSCP in bits 0-5), which the later packets of an offloaded flow never
+    # pass. Flows without such a mark are left as they are.
+    ppe_param ct_dscp true 2>/dev/null
     ppe_param dl_shaper $ifb || return 1
     sqm_log "ppe_cake: upload on $UL, download on $ifb"
 }
