@@ -301,6 +301,17 @@ sqm_stop() {
     [ -n "$ul" ] && [ -e /sys/class/net/$(ifb_name $ul) ] && delete_ifb $(ifb_name $ul)
     clear_filters $IFACE
     [ -e /sys/class/net/$ifb ] && delete_ifb $ifb
+
+    # The qdiscs that held this script's filters go once nothing else uses
+    # them, or a script started after this one could not add its own
+    # (piece_of_cake on the uplink fails on "Exclusivity flag on"). Plain tc:
+    # $TC captures its output.
+    for d in $ul $IFACE; do
+        [ -e /sys/class/net/$d ] || continue
+        [ -z "$(tc filter show dev $d ingress)$(tc filter show dev $d egress)" ] || continue
+        SILENT=1 $TC qdisc del dev $d clsact
+        SILENT=1 $TC qdisc del dev $d ingress
+    done
     nft_cleanup
     return 0
 }
