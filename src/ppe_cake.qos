@@ -214,15 +214,22 @@ ingress() {
     ppe_param cpu_port_rate 0 2>/dev/null
 
     # ppe_hybrid keeps download flows in the switch until the download
-    # reaches CAKE's rate: a count-only meter on the port, at that rate with
-    # five milliseconds of burst so that frames arriving back to back at the
-    # line rate stay green, tells the driver when (red frames pass and are
-    # counted). It counts the Ethernet frame, so the overhead is the part of
-    # CAKE's 50 bytes outside it: preamble and gap.
+    # reaches a quarter of CAKE's rate: a count-only meter on the port, at
+    # that rate with five milliseconds of burst so that frames arriving back
+    # to back at the line rate stay green, tells the driver when (red frames
+    # pass and are counted). Nothing shapes the switch path, and slow start
+    # doubles a flow's rate every round trip: handed over only once it
+    # exceeds CAKE's rate, it arrives with about twice the window CAKE can
+    # carry and queues 35-75 ms in it. Two doublings below the rate it is in
+    # CAKE before it gets there (13-22 ms at the start, as with no hybrid;
+    # half the rate still reached 39 ms). The driver hands the download back
+    # below 60 % of the meter's rate. The meter counts the Ethernet frame, so
+    # the overhead is the part of CAKE's 50 bytes outside it: preamble and
+    # gap.
     if [ "$PPE_HYBRID" = 1 ]; then
         $TC filter add dev $IFACE parent ffff: pref 3 protocol all matchall \
-            skip_sw action police rate ${DOWNLINK}kbit \
-            burst $((DOWNLINK * 5 / 8)) overhead 20 conform-exceed pipe/pipe ||
+            skip_sw action police rate $((DOWNLINK / 4))kbit \
+            burst $((DOWNLINK * 5 / 32)) overhead 20 conform-exceed pipe/pipe ||
             sqm_warn "no count-only meter on $IFACE: the download stays in CAKE"
     fi
 
