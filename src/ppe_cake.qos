@@ -103,9 +103,57 @@ clear_filters() {
     local pref
 
     for pref in 4 5 10; do
-        SILENT=1 $TC filter del dev $1 parent ffff: pref $pref
+        SILENT=1 $TC filter del dev $1 ingress pref $pref
     done
 }
+
+# The device's ingress hook, a clsact or an ingress qdisc, whichever is there:
+# qca-ppe-qos adds its switch classifiers to the same hook. Filters go on it
+# as "ingress" (ffff:fff2), which addresses either kind; "parent ffff:" does
+# not reach a clsact's ingress block.
+ingress_hook() {
+    $TC_BINARY qdisc show dev $1 | grep -q -e "^qdisc clsact " -e "^qdisc ingress " &&
+        return 0
+    { SILENT=1 $TC qdisc add dev $1 clsact || $TC qdisc add dev $1 handle ffff: ingress; } &&
+        echo "$1 new" >> $HOOKS
+}
+
+# A clsact on the device, for an egress filter. An ingress qdisc in its place
+# is replaced only while it holds no filters; another script's are kept, and
+# the caller goes without the egress hook. A replaced one is put back by
+# sqm_stop.
+egress_hook() {
+    local q was=new
+
+    q=$($TC_BINARY qdisc show dev $1)
+    case "$q" in *"qdisc clsact "*) return 0 ;; esac
+    case "$q" in *"qdisc ingress "*)
+        [ -z "$($TC_BINARY filter show dev $1 ingress)" ] || return 1
+        SILENT=1 $TC qdisc del dev $1 ingress
+        was=ingress ;;
+    esac
+    $TC qdisc add dev $1 clsact && echo "$1 $was" >> $HOOKS
+}
+
+# The device names of the two shapers. The upload one is named after the
+# uplink, the download one after the port; when the uplink is the port
+# itself, a plain Ethernet WAN, the two would be one device and the download
+# CAKE would replace the upload one, so the upload name gets a suffix.
+shaper_names() {
+    DL_NAME=$(ifb_name $IFACE)
+    UL_NAME=$(ifb_name $UL)
+    [ "$UL_NAME" = "$DL_NAME" ] && UL_NAME="$(echo -n "$DL_NAME" | head -c 13)ul"
+    [ "$UL_NAME" = "$DL_NAME" ] && UL_NAME="$(echo -n "$DL_NAME" | head -c 13)up"
+    return 0
+}
+
+# What a stop has to undo is recorded at the start: by the time a stop runs
+# the uplink may have lost its address (a PPPoE session that went down), and
+# uplink_dev would no longer find it.
+STATE=${SQM_STATE_DIR}/${IFACE}.ppe_cake
+# The hooks the start added, one "device new" or "device ingress" (an empty
+# ingress qdisc it replaced) per line: only those are undone by a stop.
+HOOKS=${SQM_STATE_DIR}/${IFACE}.ppe_cake.hooks
 
 ppe_param() {
     local dl=$(ppe_devlink)
@@ -160,9 +208,8 @@ egress() {
     # uplink has a single transmit queue. Offloaded frames are handed to it
     # by the driver, and what the host routes itself is redirected there
     # from the uplink's egress.
-    local dev=$UL ulifb
+    local dev=$UL ulifb=$UL_NAME
 
-    ulifb=$(ifb_name $UL)
     if ppe_shaper_dev $ulifb ul; then
         dev=$ulifb
     elif [ "$USE_MQ" = 1 ] && [ "$(grep -c processor /proc/cpuinfo)" -gt 1 ]; then
@@ -176,10 +223,16 @@ egress() {
 
     if [ "$dev" != "$UL" ]; then
         SILENT=1 $TC qdisc del dev $UL root
-        SILENT=1 $TC qdisc add dev $UL clsact
-        SILENT=1 $TC filter del dev $UL egress pref 10
-        $TC filter add dev $UL egress protocol all prio 10 matchall \
-            action mirred egress redirect dev $dev || return 1
+        if egress_hook $UL; then
+            SILENT=1 $TC filter del dev $UL egress pref 10
+            $TC filter add dev $UL egress protocol all prio 10 matchall \
+                action mirred egress redirect dev $dev || return 1
+        else
+            # A plain Ethernet WAN whose ingress qdisc another script
+            # filled: the offloaded upload is still shaped, what the host
+            # sends itself is not.
+            sqm_warn "ppe_cake: $UL has an ingress qdisc in use, not a clsact; upload the host routes itself is not shaped"
+        fi
     fi
     ppe_param ul_shaper $dev || return 1
     UL_SHAPER=$dev
@@ -188,7 +241,7 @@ egress() {
 ingress() {
     local ifb diffserv wash
 
-    ifb=$(ifb_name $IFACE)
+    ifb=$DL_NAME
     ppe_shaper_dev $ifb dl || {
         [ -e /sys/class/net/$ifb ] || create_ifb $ifb || return 1
         $IP link set dev $ifb up
@@ -220,8 +273,8 @@ ingress() {
     # as the switch classifiers qca-ppe-qos installs, so only this script's
     # own filters are replaced: preferences 4, 5 and 10.
     clear_filters $IFACE
-    SILENT=1 $TC qdisc add dev $IFACE handle ffff: ingress
-    $TC filter add dev $IFACE parent ffff: protocol all prio 10 matchall \
+    ingress_hook $IFACE || return 1
+    $TC filter add dev $IFACE ingress protocol all prio 10 matchall \
         action mirred egress redirect dev $ifb || return 1
 
     # Nor may the switch's rate limit towards the host shape it again.
@@ -256,6 +309,8 @@ sqm_start() {
         return 1
     }
     UL=$(uplink_dev) || { sqm_error "no uplink device on $IFACE"; return 1; }
+    shaper_names
+    echo "UL=$UL UL_NAME=$UL_NAME DL_NAME=$DL_NAME" > $STATE
     # Which flows cross the shaped link, in either direction, is told by
     # where this device meets the switch, upload shaped or not.
     ppe_param uplink $UL || { sqm_error "the qca_ppe driver does not take an uplink"; return 1; }
@@ -286,25 +341,35 @@ sqm_stop() {
     ppe_param uplink "" 2>/dev/null
     SILENT=1 $TC qdisc del dev $IFACE root
 
-    ul=$(uplink_dev)
-    ifb=$(ifb_name $IFACE)
-    [ -n "$ul" ] && SILENT=1 $TC qdisc del dev $ul root
+    # The names the start recorded, else those it would have used.
+    UL= UL_NAME= DL_NAME=
+    [ -f $STATE ] && . $STATE
+    [ -n "$UL" ] || UL=$(uplink_dev)
+    [ -n "$DL_NAME" ] || shaper_names
+    ul=$UL
+    [ -n "$ul" ] && [ "$ul" != "$IFACE" ] && SILENT=1 $TC qdisc del dev $ul root
     [ -n "$ul" ] && clear_filters $ul
     [ -n "$ul" ] && SILENT=1 $TC filter del dev $ul egress pref 10
-    [ -n "$ul" ] && [ -e /sys/class/net/$(ifb_name $ul) ] && delete_ifb $(ifb_name $ul)
     clear_filters $IFACE
-    [ -e /sys/class/net/$ifb ] && delete_ifb $ifb
+    # IFBs only: the driver removed its own shaper devices when the
+    # directions were cleared above.
+    for ifb in $UL_NAME $DL_NAME; do
+        [ -e /sys/class/net/$ifb ] && $IP -d link show dev $ifb | grep -q " ifb " &&
+            delete_ifb $ifb
+    done
 
-    # The qdiscs that held this script's filters go once nothing else uses
-    # them, or a script started after this one could not add its own
-    # (piece_of_cake on the uplink fails on "Exclusivity flag on"). Plain tc:
-    # $TC captures its output.
-    for d in $ul $IFACE; do
+    # The hooks the start added go once nothing else uses them, or a script
+    # started after this one could not add its own (piece_of_cake on the
+    # uplink fails on "Exclusivity flag on"); an ingress qdisc the start
+    # replaced comes back. Plain tc: $TC captures its output.
+    [ -f $HOOKS ] && while read d was; do
         [ -e /sys/class/net/$d ] || continue
         [ -z "$(tc filter show dev $d ingress)$(tc filter show dev $d egress)" ] || continue
         SILENT=1 $TC qdisc del dev $d clsact
         SILENT=1 $TC qdisc del dev $d ingress
-    done
+        [ "$was" = ingress ] && SILENT=1 $TC qdisc add dev $d handle ffff: ingress
+    done < $HOOKS
+    rm -f $STATE $HOOKS
     nft_cleanup
     return 0
 }
