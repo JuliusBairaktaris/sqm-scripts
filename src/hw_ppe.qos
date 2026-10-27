@@ -91,7 +91,7 @@ egress() {
     # queue limit. The qdisc below it shapes the CPU path, which is where
     # anything not offloaded still travels.
     $TC qdisc add dev $IFACE root handle 1: tbf \
-        rate ${UPLINK}kbit burst $burst limit $limit
+        rate ${UPLINK}kbit burst $burst limit $limit || return 1
     $TC qdisc add dev $IFACE parent 1: handle 110: $QDISC \
         $(get_limit ${ELIMIT}) $(get_target "${ETARGET}" ${UPLINK}) \
         $(get_ecn ${EECN}) $(get_flows ${UPLINK}) ${EQDISC_OPTS}
@@ -99,8 +99,7 @@ egress() {
 
 # The other ports of the switch this interface belongs to, taken from what is
 # present rather than from a name or a count - the port set differs across
-# IPQ807x boards. Also what a teardown walks, so that it reaches the same ports
-# without having to know what the configuration was when they came up.
+# IPQ807x boards.
 ingress_ports() {
     local sw id dev
 
@@ -115,7 +114,7 @@ ingress_ports() {
 }
 
 ingress() {
-    local dev ports wanmac
+    local dev ports root wanmac
 
     if ! ports="$(ingress_ports)" ; then
         sqm_error "$IFACE is not a switch port; the download direction needs one"
@@ -127,21 +126,49 @@ ingress() {
     # band the WAN mark selects, and its rate goes to the band's own
     # scheduler node, so only what wears the mark is shaped. hw 1 makes an
     # offload failure a failure, the same stance skip_sw takes for a filter.
+    # A port's root is taken only from the kernel's default (handle 0:); a
+    # root someone else set is theirs, and a port this cannot shape fails the
+    # start. Each band is recorded once it is in place, for the teardown.
+    # Check record access before the first add. If an append still fails,
+    # attempt to remove that band and fail the start, logging a failed
+    # rollback too.
+    bands_teardown || return 1
+    # A redirection error on ':' can exit a POSIX shell. Confine it to a
+    # subshell so the caller can still run the failed-start cleanup.
+    if ! ( : >> "$BANDS" ) ; then
+        sqm_error "cannot write $BANDS; not adding the download bands"
+        return 1
+    fi
     for dev in $ports ; do
-        SILENT=1 $TC qdisc del dev $dev root
+        if ! root="$($TC_BINARY qdisc show dev $dev root)" ; then
+            sqm_error "cannot read the root qdisc of $dev"
+            return 1
+        fi
+        case "$(echo "$root" | head -n 1)" in
+            "qdisc "*" 0: root"*) ;;
+            *)
+                sqm_error "$dev has a root qdisc this script did not add; not replacing it"
+                return 1 ;;
+        esac
         $TC qdisc add dev $dev root handle 1: mqprio num_tc 2 \
             map 0 0 0 0 0 0 0 0 1 1 1 1 1 1 1 1 queues 8@0 4@8 \
             hw 1 mode channel shaper bw_rlimit \
             max_rate 0 ${DOWNLINK}kbit || return 1
+        if ! echo "$dev" >> $BANDS ; then
+            sqm_error "cannot record the download band on $dev in $BANDS; removing it"
+            $TC qdisc del dev $dev root ||
+                sqm_error "the unrecorded download band on $dev is still in place"
+            return 1
+        fi
     done
 
     # The mark. A frame arriving on the WAN port addressed to the port is a
     # routed download frame - bridged traffic is addressed to the host
     # behind a local port, never to this one.
     wanmac="$(cat /sys/class/net/$IFACE/address)"
-    $TC qdisc add dev $IFACE handle ffff: ingress 2>/dev/null
-    SILENT=1 $TC filter del dev $IFACE parent ffff: pref 511
-    $TC filter add dev $IFACE parent ffff: pref 511 protocol all flower \
+    ingress_hook $IFACE || return 1
+    SILENT=1 $TC filter del dev $IFACE ingress pref 511
+    $TC filter add dev $IFACE ingress pref 511 protocol all flower \
         skip_sw dst_mac $wanmac \
         action skbedit priority $DL_BAND_PRIO || return 1
 
@@ -152,25 +179,87 @@ ingress() {
         value ${DOWNLINK} cmode runtime || return 1
 }
 
+# The port's ingress hook, a clsact or an ingress qdisc, whichever is there:
+# qca-ppe-qos adds its switch classifiers to the same hook, and adding the
+# other kind next to it fails ("Exclusivity flag on"). Filters go on it as
+# "ingress" (ffff:fff2), which addresses either kind.
+# A hook this script adds is recorded in $HOOKS, and only such a hook is
+# deleted again: one that was there before belongs to whoever added it.
+ingress_hook() {
+    $TC_BINARY qdisc show dev $1 | grep -q -e "^qdisc clsact " -e "^qdisc ingress " &&
+        return 0
+    { SILENT=1 $TC qdisc add dev $1 clsact || $TC qdisc add dev $1 handle ffff: ingress; } &&
+        echo "$1" >> $HOOKS
+}
+
+HOOKS=${SQM_STATE_DIR}/${IFACE}.hw_ppe.hooks
+BANDS=${SQM_STATE_DIR}/${IFACE}.hw_ppe.bands
+
 # The switch the uplink port belongs to, as devlink names it.
 ppe_devlink() {
     devlink port show $IFACE 2>/dev/null | sed -n '1s|/[0-9]*:.*||p'
 }
 
-# What ingress() built, deleted from what is present rather than from the
-# configuration, so that it reaches the same ports whatever the configuration
-# was when they came up.
+# The download bands ingress() recorded, each deleted only while the port's
+# root still is an mqprio with handle 1: - a root put there since is someone
+# else's, and its port leaves the record. Another mqprio 1: put there since
+# cannot be told apart and goes too. A port whose root cannot be read or
+# deleted stays in the record and fails the teardown, so that a later stop
+# or start can try again.
+bands_teardown() {
+    local dev root recorded keep=
+
+    [ -e $BANDS ] || return 0
+    if [ ! -f $BANDS ] ; then
+        sqm_error "$BANDS is not a file; the download bands were not removed"
+        return 1
+    fi
+    if ! recorded="$(cat "$BANDS")" ; then
+        sqm_error "cannot read $BANDS; keeping the download band record"
+        return 1
+    fi
+    for dev in $recorded ; do
+        if ! root="$($TC_BINARY qdisc show dev $dev root)" ; then
+            keep="$keep $dev"
+            continue
+        fi
+        case "$root" in
+            "qdisc mqprio 1: "*)
+                $TC qdisc del dev $dev root || keep="$keep $dev" ;;
+        esac
+    done
+    if [ -n "$keep" ] ; then
+        sqm_error "the download band on$keep was not removed; kept in $BANDS"
+        # Should the rewrite fail, the old record stays: a superset, which
+        # the next teardown checks port by port again.
+        { printf '%s\n' $keep > $BANDS.new && mv -f $BANDS.new $BANDS; } ||
+            rm -f $BANDS.new
+        return 1
+    fi
+    rm -f $BANDS
+}
+
+# What ingress() built. The bands come from its record rather than from the
+# configuration, so that the teardown reaches the same ports whatever the
+# configuration was when they came up. Fails if a band stays behind.
 ingress_teardown() {
-    local dev
+    local ret=0
 
     # Only this script's mark: the port's ingress may carry other filters,
     # such as the switch classifiers qca-ppe-qos installs.
-    SILENT=1 $TC filter del dev $IFACE parent ffff: pref 511
-    for dev in $(ingress_ports) ; do
-        SILENT=1 $TC qdisc del dev $dev root
-    done
+    SILENT=1 $TC filter del dev $IFACE ingress pref 511
+    # A hook ingress_hook() added goes once nothing else uses it, so another
+    # script can add the kind it wants. Plain tc: $TC captures its output.
+    if [ -f $HOOKS ] &&
+       [ -z "$(tc filter show dev $IFACE ingress)$(tc filter show dev $IFACE egress)" ]; then
+        SILENT=1 $TC qdisc del dev $IFACE clsact
+        SILENT=1 $TC qdisc del dev $IFACE ingress
+    fi
+    rm -f $HOOKS
+    bands_teardown || ret=1
     devlink dev param set $(ppe_devlink) name cpu_port_rate \
         value 0 cmode runtime 2>/dev/null
+    return $ret
 }
 
 # sqm_start_default allocates an ifb before either direction runs and fails
@@ -190,26 +279,34 @@ sqm_start() {
 
     if [ "${UPLINK}" -ne 0 ] ; then
         CUR_DIRECTION="egress"
-        egress
+        # A start that fails half way leaves nothing behind.
+        egress || { sqm_stop; return 1; }
     else
         SILENT=1 $TC qdisc del dev ${IFACE} root
     fi
 
     if [ "${DOWNLINK}" -ne 0 ] ; then
         CUR_DIRECTION="ingress"
-        ingress || return 1
+        ingress || { sqm_stop; return 1; }
     else
-        ingress_teardown
+        # A band left from an earlier run that will not come off is a
+        # download still shaped, so this start fails too.
+        ingress_teardown || { sqm_stop; return 1; }
     fi
 
     return 0
 }
 
+# A band the teardown could not remove fails the stop, and its record stays
+# for the next stop or start to retry. stop-sqm removes the state file
+# whatever this returns, so that retry is usually the next start.
 sqm_stop() {
-    ingress_teardown
+    local ret=0
+
+    ingress_teardown || ret=1
     SILENT=1 $TC qdisc del dev $IFACE root
     nft_cleanup
-    return 0
+    return $ret
 }
 
 sqm_prepare_script() {
